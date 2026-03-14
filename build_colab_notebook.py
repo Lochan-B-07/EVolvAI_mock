@@ -184,7 +184,7 @@ cells = [
         "cell_type": "markdown",
         "metadata": {},
         "source": [
-            "# EVolvAI: Generative Counterfactual Framework\\n",
+            "# EVolvAI: Generative Counterfactual Framework\n",
             "This notebook combines the PyTorch models, data loader, and training script into a single environment for easy execution on Google Colab GPUs. Because you are training on Colab, you don't have to worry about the RAM/resource limitations of a MacBook Air."
         ]
     },
@@ -202,7 +202,7 @@ cells = [
         "execution_count": None,
         "metadata": {},
         "outputs": [],
-        "source": [line + "\\n" for line in code.split("\\n")]
+        "source": [line + "\n" for line in code.split("\n")]
     }
 ]
 
