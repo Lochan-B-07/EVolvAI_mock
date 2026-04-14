@@ -259,10 +259,11 @@ class GenerativeCounterfactualVAE(nn.Module):
 
 def vae_loss_function(recon_x: torch.Tensor, x: torch.Tensor,
                       mu: torch.Tensor, logvar: torch.Tensor,
-                      physics_loss: torch.Tensor = torch.tensor(0.0)) -> torch.Tensor:
+                      physics_loss: torch.Tensor = torch.tensor(0.0),
+                      current_kld_weight: float = 0.0) -> torch.Tensor:
     """β-VAE loss: MSE reconstruction + KL divergence + Physics Penalty.
 
-    L = MSE(x̂, x) + β · KL[q(Z|X) ‖ N(0, I)] + Physics Penalty
+    L = MSE(x̂, x) + current_kld_weight · KL[q(Z|X) ‖ N(0, I)] + Physics Penalty
 
     Args:
         recon_x: Reconstructed output [B, F, T].
@@ -270,10 +271,15 @@ def vae_loss_function(recon_x: torch.Tensor, x: torch.Tensor,
         mu:      Encoder mean [B, latent_dim].
         logvar:  Encoder log-variance [B, latent_dim].
         physics_loss: Aggregated LinDistFlow penalty scalar.
+        current_kld_weight: Dynamic β passed in from the training loop.
+                            Use 0.0 at epoch 1 and ramp up via annealing schedule.
+                            Replaces the static config.KLD_WEIGHT so the caller
+                            has full control over the annealing curve.
 
     Returns:
         Scalar loss tensor.
     """
     recon = F.mse_loss(recon_x, x, reduction="mean")
     kld   = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    return recon + config.KLD_WEIGHT * kld + physics_loss
+    return recon + current_kld_weight * kld + physics_loss
+

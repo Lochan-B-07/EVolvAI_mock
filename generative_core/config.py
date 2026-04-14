@@ -24,10 +24,12 @@ SEQ_LEN = 24
 """int: Temporal resolution – one profile = 24 hourly slots (midnight to 23:00)."""
 
 # ─── Physics Penalties ────────────────────────────────────────────────────────
-LAMBDA_VOLT = 1.0
-LAMBDA_THERMAL = 2.0
-LAMBDA_XFMR = 2.0
-"""float: Weights for the LinDistFlow physics-informed losses."""
+LAMBDA_VOLT    = 0.0
+LAMBDA_THERMAL = 0.0
+LAMBDA_XFMR   = 0.0
+"""float: Physics penalty weights — set to 0.0 during isolation training
+to prevent the decoder collapsing to zero-output local minima.
+Re-enable (1.0, 2.0, 2.0) in a second training phase once the VAE converges."""
 
 NUM_WEATHER_FEATURES = 4
 """int: Number of weather/environment channels appended to each charging sample.
@@ -101,8 +103,8 @@ Raised from 128 → 512 to match the wider TCN and latent space."""
 LEARNING_RATE = 1e-3
 """float: Adam initial learning rate.  Drop to 1e-4 if training loss explodes."""
 
-EPOCHS = 10
-"""int: Training epochs for local runs.  Set to ≥50 on Colab (T4 GPU)."""
+EPOCHS = 150
+"""int: Training epochs.  150 for isolation phase; raise to 1000+ for full physics run."""
 
 KLD_WEIGHT = 1.0
 """float: β in the β-VAE loss: L = MSE + β * KLD.

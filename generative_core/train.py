@@ -69,7 +69,9 @@ def train(epochs: int = config.EPOCHS, save: bool = True):
         epoch_loss = 0.0
         num_batches = 0
 
-        for batch in loader:
+        # Linear KLD warmup: β ramps 0.0 → 0.1 over first 50 epochs, then holds.
+        # Physics lambdas (in config) are set to 0.0 during isolation training.
+        current_kld = min(0.1, (epoch - 1) / 50.0)
             # DataLoader yields [B, seq_len, features]; Conv1d expects
             # [B, features, seq_len] – permute here, not in the dataset.
             x = batch.permute(0, 2, 1).to(device)
