@@ -46,8 +46,10 @@ NUM_FEATURES = NUM_NODES + NUM_WEATHER_FEATURES
 NUM_SAMPLES = 1000
 """int: Synthetic sample count used when no real parquet is available."""
 
-BATCH_SIZE = 32
-"""int: Mini-batch size for the training DataLoader."""
+BATCH_SIZE = 64
+"""int: Mini-batch size for the training DataLoader.
+Raised to 64 — larger batches provide more stable gradient estimates
+for the bigger model and give ~31 batches/epoch with 2000 training days."""
 
 DATA_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "train_data.parquet")
 """str: Absolute path to the preprocessed training parquet.
@@ -58,22 +60,26 @@ Expected schema (one row per node per hour):
 
 
 # ─── Model Architecture ───────────────────────────────────────────────────────
-TCN_CHANNELS = [32, 64]
+TCN_CHANNELS = [128, 256, 256, 256, 256]
 """list[int]: Output channel width for each TCN residual block.
-Dilation doubles with each block (1, 2, 4, ...) giving an exponentially
-growing receptive field without stacking many layers."""
+Dilations are [1, 2, 4, 8, 16] — 5 blocks give a receptive field of
+(2-1)*(1+2+4+8+16) = 31 steps, covering the full 24-hour window.
+With 256 channels the parameter count jumps from ~280k to ~8M,
+requiring GPU for comfortable training."""
 
-KERNEL_SIZE = 2
-"""int: Causal convolution kernel size.  Small kernel + dilation = efficient."""
+KERNEL_SIZE = 3
+"""int: Causal convolution kernel size.  3 + dilated stacking increases
+receptive field coverage compared to kernel-2 at the same depth."""
 
-DROPOUT = 0.2
-"""float: Dropout probability applied after each activation in TCN blocks.
-Increase to 0.3 if the model overfits on small real datasets."""
+DROPOUT = 0.15
+"""float: Dropout probability after each activation in TCN blocks.
+Slightly lower than before because the larger model is already regularised
+by its depth; keep at 0.2 if overfitting on small real datasets."""
 
-LATENT_DIM = 16
+LATENT_DIM = 128
 """int: Dimensionality of the VAE latent space Z.
-Larger = more expressive but slower to train and harder to decode.
-Suggested range: 8–64."""
+Raised from 16 → 128 to give the encoder enough bandwidth to represent
+complex spatial loading patterns across 32 grid nodes without blurring."""
 
 COND_DIM = 6
 """int: Length of the condition vector C injected into the decoder.
@@ -86,8 +92,9 @@ Must equal the length of every `condition` list in SCENARIOS and BASELINE_CONDIT
   C[5] – traffic index (float, 0.0 = empty roads, 1.0 = rush-hour gridlock)
 """
 
-DECODER_HIDDEN = 128
-"""int: Hidden layer width in the decoder fully-connected block."""
+DECODER_HIDDEN = 512
+"""int: Hidden layer width in the decoder fully-connected block.
+Raised from 128 → 512 to match the wider TCN and latent space."""
 
 
 # ─── Training ─────────────────────────────────────────────────────────────────

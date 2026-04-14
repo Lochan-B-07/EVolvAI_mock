@@ -1,30 +1,30 @@
 """
 generative_core/data_loader.py
-===============================
-Dataset and DataLoader for EV charging demand + weather time-series.
+================================
+PyTorch Dataset + DataLoader for the EVolvAI physics-informed TCN-VAE.
 
-The loader has two operating modes that switch automatically:
+Two operating modes (auto-detected):
+  1. REAL   — reads data/processed/train_data.parquet produced by
+              data_pipeline/preprocess.py
+  2. SYNTH  — falls back to Lochan's EV schedule generator when no
+              parquet exists (same schedule generator used in train.py)
 
-  1. **Real data** (preferred): reads a parquet file at config.DATA_PATH.
-     The file must contain the columns:
-       date (str/date), hour (int, 0–23), node_id (str), demand_kw (float)
-     It is pivoted so rows = (date, hour) and columns = node_id, then reshaped
-     to [num_days, SEQ_LEN, NUM_NODES].
+In both cases every batch yields:
+    x     : FloatTensor [B, NUM_FEATURES, SEQ_LEN]   (Conv1d channel-first)
+    cond  : FloatTensor [B, COND_DIM]                 (dynamic per date)
 
-  2. **Synthetic fallback**: if the parquet doesn't exist or fails validation,
-     generates a diurnal sinusoidal pattern with uniform random noise.
-     This unblocks model development while waiting for real data.
-
-In either case, three synthetic weather channels (temperature, precipitation,
-wind) are appended.  Replace with real hourly weather CSVs via the
-`data_pipeline/preprocess.py` script once the data is sourced.
-
-All arrays are Z-score normalised before being concatenated, which ensures
-that the weather and demand channels live on the same scale.
+Condition vector layout (COND_DIM = 6):
+    C[0]  temperature_anomaly   float  normalised deviation from monthly mean
+    C[1]  ev_multiplier         float  1.0 = today's fleet size
+    C[2]  solar_availability    float  0=night/cloudy, 1=full sun
+    C[3]  weekend               0/1
+    C[4]  holiday               0/1
+    C[5]  traffic_index         float  0=empty roads, 1=gridlock rush hour
 """
 
 import logging
-from typing import Optional
+import os
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -32,166 +32,241 @@ from torch.utils.data import Dataset, DataLoader
 
 from . import config
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _znorm(arr: np.ndarray) -> np.ndarray:
+    """Z-score normalise an array, safe for zero-variance inputs."""
+    std = arr.std()
+    if std < 1e-8:
+        return arr - arr.mean()
+    return (arr - arr.mean()) / (std + 1e-8)
+
+
+def _date_to_condition(date_str: str, temp_anomaly: float = 0.0) -> list:
+    """
+    Derive a 6-D condition vector from a date string (YYYY-MM-DD).
+
+    Fields computed deterministically so training is reproducible:
+      weekend flag   – 1 if Saturday or Sunday
+      solar          – approximated from declination (summer = more solar)
+      traffic        – weekday mornings = high, weekends = low
+      holiday        – not computed here (always 0; extend with holidays lib)
+      temp_anomaly   – fed in from weather data if available, else 0.0
+      ev_multiplier  – always 1.0 during training (only changed at generation)
+    """
+    import datetime
+    try:
+        d = datetime.date.fromisoformat(date_str)
+    except Exception:
+        return [0.0, 1.0, 0.5, 0.0, 0.0, 0.5]
+
+    dow       = d.weekday()         # 0=Mon … 6=Sun
+    is_wknd   = float(dow >= 5)
+
+    # Solar availability: rough proxy using day-of-year (summer = high)
+    doy       = d.timetuple().tm_yday
+    solar     = 0.5 + 0.5 * np.sin((doy - 80) * 2 * np.pi / 365)
+
+    # Traffic: high on weekday rush hours (simplified to day-level proxy)
+    traffic   = 0.85 if dow < 5 else 0.30
+
+    return [
+        float(np.clip(temp_anomaly, -1.0, 1.0)),   # C[0] temperature anomaly
+        1.0,                                         # C[1] EV multiplier (baseline)
+        float(np.clip(solar, 0.0, 1.0)),            # C[2] solar availability
+        is_wknd,                                     # C[3] weekend flag
+        0.0,                                         # C[4] holiday flag
+        float(traffic),                              # C[5] traffic index
+    ]
+
+
+# ─── Real parquet loader ──────────────────────────────────────────────────────
+
+def _load_parquet(num_nodes: int, seq_len: int) -> Optional[Tuple[np.ndarray, list]]:
+    """
+    Load and validate the preprocessed parquet.
+
+    Returns
+    -------
+    (demand, dates)
+        demand : float32 ndarray [N_days, seq_len, num_nodes]  (kW)
+        dates  : list[str]  one entry per day
+    or None on failure.
+    """
+    if not os.path.isfile(config.DATA_PATH):
+        log.info("Parquet not found at %s — using synthetic fallback.", config.DATA_PATH)
+        return None
+
+    try:
+        import pandas as pd
+        df = pd.read_parquet(config.DATA_PATH)
+
+        required = {"date", "hour", "node_id", "demand_kw"}
+        missing  = required - set(df.columns)
+        if missing:
+            log.warning("Parquet missing columns %s — falling back.", missing)
+            return None
+
+        # Pivot: rows = (date, hour), columns = node_id
+        pivot = df.pivot_table(
+            index=["date", "hour"], columns="node_id", values="demand_kw",
+            aggfunc="sum", fill_value=0.0,
+        )
+
+        if pivot.shape[1] != num_nodes:
+            log.warning(
+                "Parquet has %d nodes but NUM_NODES=%d — falling back.",
+                pivot.shape[1], num_nodes,
+            )
+            return None
+
+        # Group by date → [N, seq_len, num_nodes]
+        dates_in_pivot = pivot.index.get_level_values("date").unique().tolist()
+        days = []
+        valid_dates = []
+        for date in sorted(dates_in_pivot):
+            try:
+                day = pivot.loc[date]                     # [24, num_nodes]
+                if len(day) != seq_len:
+                    continue                              # skip incomplete days
+                days.append(day.values.astype(np.float32))
+                valid_dates.append(date)
+            except Exception:
+                continue
+
+        if len(days) < 2:
+            log.warning("Too few valid days in parquet — falling back.")
+            return None
+
+        demand = np.stack(days, axis=0)                  # [N, 24, num_nodes]
+        log.info(
+            "Parquet loaded: %d days × %d h × %d nodes",
+            len(valid_dates), seq_len, num_nodes,
+        )
+        return demand, valid_dates
+
+    except Exception as exc:
+        log.warning("Parquet load failed (%s) — falling back.", exc)
+        return None
+
+
+# ─── Synthetic fallback (Lochan generator) ────────────────────────────────────
+
+def _generate_synthetic(num_samples: int, num_nodes: int,
+                         seq_len: int) -> Tuple[np.ndarray, list]:
+    """Lochan-style synthetic demand + dummy date list."""
+    import datetime
+    rng      = np.random.default_rng(42)
+    base_dt  = datetime.date(2022, 1, 1)
+
+    base    = rng.uniform(10, 100, (num_samples, seq_len, num_nodes))
+    diurnal = np.clip(
+        [1 + np.sin((h - 12) * np.pi / 12) for h in range(seq_len)],
+        0.5, 2.0,
+    ).reshape(1, seq_len, 1)
+    demand = (base * diurnal).astype(np.float32)
+
+    dates = [(base_dt + datetime.timedelta(days=i)).isoformat()
+             for i in range(num_samples)]
+
+    log.info("Synthetic fallback: %d samples generated.", num_samples)
+    return demand, dates
+
+
+# ─── Dataset class ────────────────────────────────────────────────────────────
 
 class EVDemandDataset(Dataset):
-    """PyTorch Dataset of 24-hour EV demand + weather profiles.
+    """
+    PyTorch Dataset of 24-hour EV demand + weather profiles.
 
-    Each sample is a single daily profile of shape [SEQ_LEN, NUM_FEATURES]
-    where NUM_FEATURES = NUM_NODES + NUM_WEATHER_FEATURES.
+    Each sample is a tuple (x, cond):
+        x    : FloatTensor [NUM_FEATURES, SEQ_LEN]   channel-first for Conv1d
+        cond : FloatTensor [COND_DIM]                dynamic per-date condition
 
-    The time axis is last here to match NumPy convention; the DataLoader
-    consumer (train.py) permutes to [features, seq_len] for Conv1d.
-
-    Args:
-        num_samples (int): How many days to synthesise when no parquet exists.
-        num_nodes (int): Expected number of spatial grid nodes.
-        seq_len (int): Expected hours per daily profile.
+    Automatically reads the real parquet if available, otherwise falls back
+    to the synthetic generator — the rest of the pipeline sees no difference.
     """
 
     def __init__(self,
-                 num_samples: int = config.NUM_SAMPLES,
-                 num_nodes: int = config.NUM_NODES,
-                 seq_len: int = config.SEQ_LEN):
+                 num_nodes:   int = config.NUM_NODES,
+                 seq_len:     int = config.SEQ_LEN,
+                 num_samples: int = config.NUM_SAMPLES):
 
-        charge = self._try_load_real(num_nodes, seq_len)
-        if charge is None:
-            charge = self._generate_synthetic(num_samples, num_nodes, seq_len)
+        result = _load_parquet(num_nodes, seq_len)
 
-        actual_samples = charge.shape[0]
+        if result is not None:
+            demand, self._dates = result
+            self._source = "real"
+        else:
+            demand, self._dates = _generate_synthetic(num_samples, num_nodes, seq_len)
+            self._source = "synthetic"
 
-        # Append weather channels.  Once real weather data is available, replace
-        # this block with a merger against the real parquet weather columns.
-        weather = np.random.uniform(
-            -10, 40,
-            (actual_samples, seq_len, config.NUM_WEATHER_FEATURES),
-        ).astype(np.float32)
+        n_days = demand.shape[0]
 
-        # Z-score normalise independently to put all channels on the same scale.
-        charge  = self._normalize(charge)
-        weather = self._normalize(weather)
+        # Build weather channels: [N, seq_len, NUM_WEATHER_FEATURES]
+        # Real weather integration: replace this block with a weather parquet join.
+        rng     = np.random.default_rng(0)
+        weather = rng.uniform(-10, 40,
+                              (n_days, seq_len, config.NUM_WEATHER_FEATURES)).astype(np.float32)
 
-        # Final shape: [samples, seq_len, num_nodes + NUM_WEATHER_FEATURES]
-        self.data = np.concatenate([charge, weather], axis=-1)
+        # Z-score normalise demand and weather separately
+        demand_n  = _znorm(demand)
+        weather_n = _znorm(weather)
 
-    # ── private helpers ───────────────────────────────────────────────────────
+        # [N, seq_len, num_nodes + NUM_WEATHER_FEATURES]
+        self._data = np.concatenate([demand_n, weather_n], axis=-1).astype(np.float32)
 
-    @staticmethod
-    def _normalize(arr: np.ndarray) -> np.ndarray:
-        """Z-score normalise an array, safe against zero-variance inputs.
+        # Pre-compute condition vectors for every day
+        self._conds = np.array(
+            [_date_to_condition(d) for d in self._dates],
+            dtype=np.float32,
+        )  # [N, COND_DIM]
 
-        Args:
-            arr: Any float32 NumPy array.
-
-        Returns:
-            Normalised copy of arr.  If std < 1e-8, only the mean is subtracted.
-        """
-        std = arr.std()
-        if std < 1e-8:
-            return arr - arr.mean()
-        return (arr - arr.mean()) / (std + 1e-8)
-
-    @staticmethod
-    def _try_load_real(num_nodes: int, seq_len: int) -> Optional[np.ndarray]:
-        """Attempt to load and validate the real parquet dataset.
-
-        Checks:
-          * File exists at config.DATA_PATH.
-          * Required columns are present.
-          * Node count after pivoting matches num_nodes.
-
-        Args:
-            num_nodes: Expected column count after pivoting on node_id.
-            seq_len:   Expected row-per-group count (hours in a day).
-
-        Returns:
-            float32 array [num_days, seq_len, num_nodes], or None on failure.
-        """
-        import os
-        if not os.path.isfile(config.DATA_PATH):
-            logger.info("Parquet not found at %s – using synthetic data.", config.DATA_PATH)
-            return None
-
-        try:
-            import pandas as pd
-            df = pd.read_parquet(config.DATA_PATH)
-
-            required = {"date", "hour", "node_id", "demand_kw"}
-            missing = required - set(df.columns)
-            if missing:
-                logger.warning("Parquet missing columns %s – falling back to synthetic.", missing)
-                return None
-
-            pivot = df.pivot_table(
-                index=["date", "hour"], columns="node_id", values="demand_kw",
-            )
-            if pivot.shape[1] != num_nodes:
-                logger.warning(
-                    "Parquet has %d nodes but config.NUM_NODES=%d – falling back.",
-                    pivot.shape[1], num_nodes,
-                )
-                return None
-
-            charge = pivot.values.reshape(-1, seq_len, num_nodes).astype(np.float32)
-            logger.info("Loaded real data: %d samples from %s.", charge.shape[0], config.DATA_PATH)
-            return charge
-
-        except Exception as exc:        # parquet read / reshape can raise many things
-            logger.warning("Parquet load failed (%s) – falling back to synthetic.", exc)
-            return None
-
-    @staticmethod
-    def _generate_synthetic(num_samples: int, num_nodes: int, seq_len: int) -> np.ndarray:
-        """Generate a diurnal synthetic charging dataset.
-
-        The base is uniform random kW per node, modulated by a sine wave that
-        peaks around hour 18 (evening commute return).  This is realistic enough
-        for architecture debugging and async team handoff.
-
-        Args:
-            num_samples: Number of daily profiles to produce.
-            num_nodes:   Spatial grid size.
-            seq_len:     Hours per profile (normally 24).
-
-        Returns:
-            float32 array [num_samples, seq_len, num_nodes] in kW.
-        """
-        base = np.random.uniform(10, 100, (num_samples, seq_len, num_nodes))
-        # Diurnal multiplier: 0.5 at midnight, ~2.0 at hour 18 (evening peak)
-        diurnal = np.clip(
-            [1 + np.sin((h - 12) * np.pi / 12) for h in range(seq_len)],
-            0.5, 2.0,
-        ).reshape(1, seq_len, 1)
-        return (base * diurnal).astype(np.float32)
+        log.info(
+            "EVDemandDataset ready [%s]: %d samples  shape=%s  cond_dim=%d",
+            self._source, n_days, self._data.shape, self._conds.shape[1],
+        )
 
     # ── Dataset interface ─────────────────────────────────────────────────────
 
     def __len__(self) -> int:
-        # Use the actual array length, not the constructor argument, so that
-        # real parquet datasets with fewer rows don't cause an index error.
-        return self.data.shape[0]
+        return len(self._data)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        """Return the profile at index idx as a float32 tensor.
-
-        Returns:
-            Tensor of shape [seq_len, num_features].
-            train.py permutes this to [num_features, seq_len] for Conv1d.
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        return torch.from_numpy(self.data[idx])
+        Returns
+        -------
+        x    : FloatTensor [NUM_FEATURES, SEQ_LEN]   (channel-first)
+        cond : FloatTensor [COND_DIM]
+        """
+        x    = torch.from_numpy(self._data[idx])       # [seq_len, features]
+        x    = x.permute(1, 0)                         # [features, seq_len] ← Conv1d
+        cond = torch.from_numpy(self._conds[idx])
+        return x, cond
 
+    @property
+    def source(self) -> str:
+        return self._source
+
+
+# ─── DataLoader factory ───────────────────────────────────────────────────────
 
 def get_dataloader(batch_size: int = config.BATCH_SIZE,
-                   num_nodes: int = config.NUM_NODES) -> DataLoader:
-    """Build and return a shuffled training DataLoader.
+                   num_nodes:  int = config.NUM_NODES,
+                   shuffle:    bool = True) -> DataLoader:
+    """
+    Build and return a shuffled training DataLoader.
 
-    Args:
-        batch_size: Mini-batch size (default from config).
-        num_nodes:  Grid size used to validate real parquet node count.
-
-    Returns:
-        DataLoader yielding [batch, seq_len, num_features] float32 tensors.
+    Returns
+    -------
+    DataLoader yielding (x, cond) tuples:
+        x    : [B, NUM_FEATURES, SEQ_LEN]
+        cond : [B, COND_DIM]
     """
     dataset = EVDemandDataset(num_nodes=num_nodes)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader  = DataLoader(dataset, batch_size=batch_size,
+                         shuffle=shuffle, num_workers=0, pin_memory=False)
+    log.info("DataLoader: source=%s  batches/epoch=%d", dataset.source, len(loader))
+    return loader
