@@ -37,7 +37,7 @@ Traditional generative models require manual hyperparameter tuning and architect
 
 ### Installation
 ```bash
-git clone https://github.com/user/EVolvAI
+git clone https://github.com/seeramsujay/EVolvAI
 cd EVolvAI
 pip install -r requirements.txt
 ```
