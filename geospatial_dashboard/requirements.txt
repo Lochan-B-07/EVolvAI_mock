@@ -6,3 +6,4 @@ folium
 requests
 numpy
 pandas
+python-dotenv

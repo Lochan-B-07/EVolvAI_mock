@@ -39,3 +39,6 @@ output/
 # Data
 data/
 data_pipeline/cache/
+.env
+__pycache__/
+*.pyc

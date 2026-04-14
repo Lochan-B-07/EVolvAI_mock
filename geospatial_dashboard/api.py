@@ -1,8 +1,15 @@
+import requests as req
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+import os
 import json
 import numpy as np
-from geospatial_dashboard.gini import calculate_gini, get_accessibility_scores
+from gini import calculate_gini, get_accessibility_scores
+
+# Load environment variables
+load_dotenv()
+OCMAP_API_KEY = os.getenv("OCMAP_API_KEY")
 
 app = FastAPI(
     title="EVolvAI API",
@@ -143,3 +150,44 @@ def get_gini_by_scenario(scenario: str):
 def get_scenarios():
     """Return list of available scenarios."""
     return {"scenarios": list(SCENARIOS.keys()), "details": SCENARIOS}
+
+@app.get("/api/real_chargers")
+def get_real_chargers():
+    try:
+        response = req.get(
+            "https://api.openchargemap.io/v3/poi/",
+            params={
+                "key": OCMAP_API_KEY,
+                "latitude": 17.3850,
+                "longitude": 78.4867,
+                "distance": 10000,
+                "distanceunit": "km",
+                "maxresults": 100,
+                "compact": True,
+                "verbose": False,
+                "countrycode": "IN",
+            },
+            headers={"User-Agent": "EVolvAI-Dashboard/1.0"},
+            timeout=10
+        )
+        if response.status_code != 200:
+            return {"error": f"API returned status {response.status_code}", "chargers": []}
+        
+        data = response.json()
+        chargers = []
+        for item in data:
+            if item.get("AddressInfo"):
+                chargers.append({
+                    "id": item.get("ID"),
+                    "name": item["AddressInfo"].get("Title", "Unknown"),
+                    "lat": item["AddressInfo"].get("Latitude"),
+                    "lng": item["AddressInfo"].get("Longitude"),
+                    "address": item["AddressInfo"].get("AddressLine1", ""),
+                    "num_points": item.get("NumberOfPoints", 1),
+                    "status": item.get("StatusType", {}).get("Title", "Unknown") if item.get("StatusType") else "Unknown",
+                    "operator": item.get("OperatorInfo", {}).get("Title", "Unknown") if item.get("OperatorInfo") else "Unknown",
+                })
+        return {"source": "OpenChargeMap", "count": len(chargers), "chargers": chargers}
+    except Exception as e:
+        print(f"Error fetching chargers: {e}")
+        return {"error": str(e), "chargers": []}
