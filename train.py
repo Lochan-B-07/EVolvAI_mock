@@ -28,8 +28,10 @@ def get_args():
     p.add_argument("--epochs",      type=int,   default=500,   help="Training epochs")
     p.add_argument("--batch",       type=int,   default=64,    help="Batch size")
     p.add_argument("--lr",          type=float, default=1e-3,  help="Adam learning rate")
-    p.add_argument("--days",        type=int,   default=2000,  help="Synthetic training days")
+    p.add_argument("--days",        type=int,   default=2000,  help="Synthetic training days (min 2000 recommended)")
     p.add_argument("--anneal",      type=int,   default=100,   help="KLD anneal epochs (β: 0→1)")
+    p.add_argument("--phys-anneal", type=int,   default=150,   help="Physics lambda anneal epochs (λ: 0→full). Runs alongside KLD anneal.")
+    p.add_argument("--phys-start",  type=float, default=0.0,   help="Physics lambda starting fraction (0=off, 0.1=10%% of full)")
     p.add_argument("--clip",        type=float, default=1.0,   help="Gradient clip norm")
     p.add_argument("--kld-max",     type=float, default=1.0,   help="Final KLD weight β")
     p.add_argument("--seed",        type=int,   default=42,    help="RNG seed")
@@ -160,7 +162,12 @@ def train(args):
     print(f"\n[train] Device : {device}")
     print(f"[train] Epochs : {args.epochs}  Batch : {args.batch}  "
           f"LR : {args.lr}  Days : {args.days}")
-    print(f"[train] KLD annealing : 0 → {args.kld_max} over {args.anneal} epochs\n")
+    print(f"[train] KLD   annealing : 0 → {args.kld_max} over {args.anneal} epochs")
+    print(f"[train] Phys  annealing : 0%% → 100%% over {args.phys_anneal} epochs")
+    if args.days < 500:
+        print(f"[train] ⚠️  Only {args.days} days → {args.days//args.batch} batches/epoch. Recommend --days 2000+")
+    print()
+
 
     loader = build_dataset(args.days, CFG.NUM_NODES, args.seed, args.batch)
 
@@ -179,12 +186,26 @@ def train(args):
     history = []
     t_start = time.time()
 
+    # Store base physics lambdas from config
+    _base_volt    = CFG.LAMBDA_VOLT
+    _base_thermal = CFG.LAMBDA_THERMAL
+    _base_xfmr    = CFG.LAMBDA_XFMR
+
     model.train()
     for epoch in range(1, args.epochs + 1):
 
-        # ── KLD annealing ─────────────────────────────────────────────────
+        # ── KLD annealing: β ramps 0 → kld_max over `anneal` epochs ──────
         beta = min(1.0, epoch / args.anneal) * args.kld_max
         CFG.KLD_WEIGHT = beta
+
+        # ── Physics annealing: λ ramps phys_start → 1.0 over phys_anneal ─
+        # This stops the decoder from collapsing to zeroes to avoid penalties.
+        phys_scale = args.phys_start + (1.0 - args.phys_start) * min(
+            1.0, epoch / args.phys_anneal
+        )
+        CFG.LAMBDA_VOLT    = _base_volt    * phys_scale
+        CFG.LAMBDA_THERMAL = _base_thermal * phys_scale
+        CFG.LAMBDA_XFMR    = _base_xfmr    * phys_scale
 
         epoch_loss = epoch_phys = 0.0
         n_batches  = 0
@@ -222,7 +243,7 @@ def train(args):
             lr_now  = scheduler.get_last_lr()[0]
             print(f"  Epoch {epoch:>4}/{args.epochs}  "
                   f"loss={avg_loss:.5f}  phys={avg_phys:.5f}  "
-                  f"β={beta:.2f}  lr={lr_now:.1e}  "
+                  f"β={beta:.2f}  λ={phys_scale:.2f}  lr={lr_now:.1e}  "
                   f"elapsed={elapsed:.1f}min  ETA={eta:.1f}min")
 
     total_min = (time.time() - t_start) / 60
