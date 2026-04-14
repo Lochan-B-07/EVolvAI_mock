@@ -3,3 +3,8 @@ pandas
 numpy
 pyarrow
 fastparquet
+osmnx
+geopandas
+shapely
+scipy
+requests

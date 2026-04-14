@@ -226,6 +226,7 @@ def evaluate_fitness(
     demand_scenarios: NDArray[np.float64],
     config: EVOptimizerConfig,
     rng: np.random.Generator,
+    traffic_index_tensor: Optional[NDArray[np.float64]] = None,
 ) -> float:
     """
     Master fitness function combining four cost/penalty terms into a
@@ -254,6 +255,8 @@ def evaluate_fitness(
         All cost/penalty weights and thresholds.
     rng : numpy Generator
         For the grid penalty noise.
+    traffic_index_tensor : 1-D or 2-D float array, optional
+        Multiplier representing commuter traffic jams affecting wait time.
 
     Returns
     -------
@@ -274,6 +277,10 @@ def evaluate_fitness(
     safe_ports = np.maximum(ports, 1.0)             # [N]  avoid /0
     # demand_scenarios: [S, N],  safe_ports: [N] → broadcast → [S, N]
     wait_times = demand_scenarios / safe_ports       # [S, N]
+    
+    if traffic_index_tensor is not None:
+        wait_times *= (1.0 + traffic_index_tensor)
+        
     avg_wait_penalty = float(np.mean(np.sum(wait_times, axis=1)))
     wait_cost = config.wait_time_penalty_weight * avg_wait_penalty
 
@@ -405,6 +412,7 @@ class ChargerOptimizerGA:
     def _evaluate_population(
         self,
         demand_scenarios: NDArray[np.float64],
+        traffic_index_tensor: Optional[NDArray[np.float64]] = None,
     ) -> NDArray[np.float64]:
         """
         Evaluate fitness for every chromosome in the current population.
@@ -421,7 +429,7 @@ class ChargerOptimizerGA:
         fit = np.empty(pop.shape[0], dtype=np.float64)
         for i in range(pop.shape[0]):
             fit[i] = evaluate_fitness(
-                pop[i], demand_scenarios, self.config, self.rng
+                pop[i], demand_scenarios, self.config, self.rng, traffic_index_tensor
             )
         self.fitness_values = fit
         return fit
@@ -536,6 +544,7 @@ class ChargerOptimizerGA:
     def _evolve_one_generation(
         self,
         demand_scenarios: NDArray[np.float64],
+        traffic_index_tensor: Optional[NDArray[np.float64]] = None,
     ) -> None:
         """
         Execute one full generation of the GA:
@@ -573,7 +582,7 @@ class ChargerOptimizerGA:
                 idx += 1
 
         self.population = new_pop
-        self._evaluate_population(demand_scenarios)
+        self._evaluate_population(demand_scenarios, traffic_index_tensor)
 
     # ─────────────────────────────────────────────────────────────────
     # §5.7  Main Run Loop
@@ -582,6 +591,7 @@ class ChargerOptimizerGA:
         self,
         demand_scenarios: NDArray[np.float64],
         verbose: bool = True,
+        traffic_index_tensor: Optional[NDArray[np.float64]] = None,
     ) -> dict:
         """
         Full GA optimisation loop.
@@ -617,7 +627,7 @@ class ChargerOptimizerGA:
 
         # ── initialise ──────────────────────────────────────────────
         self.initialize_population()
-        self._evaluate_population(demand_scenarios)
+        self._evaluate_population(demand_scenarios, traffic_index_tensor)
         self.history = []
 
         # track convergence
@@ -682,7 +692,7 @@ class ChargerOptimizerGA:
                 break
 
             # evolve to next generation
-            self._evolve_one_generation(demand_scenarios)
+            self._evolve_one_generation(demand_scenarios, traffic_index_tensor)
 
         elapsed = time.perf_counter() - t_start
         converged = stagnation_counter >= self.config.convergence_window
