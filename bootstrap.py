@@ -26,17 +26,29 @@ def parse_acn_data(csv_path: str) -> pd.DataFrame:
     col_map = {}
     for col in df.columns:
         lc = col.lower().replace(" ", "")
-        if "connection" in lc: col_map[col] = "connectionTime"
-        elif "disconnect" in lc: col_map[col] = "disconnectTime"
+        lc = col.lower().replace(" ", "")
+        if "connect" in lc and "time" in lc and "disconnect" not in lc: col_map[col] = "connectionTime"
+        elif "disconnect" in lc and "time" in lc: col_map[col] = "disconnectTime"
         elif "kwh" in lc or "energy" in lc: col_map[col] = "kWhDelivered"
-        elif "user" in lc or "ev" in lc: col_map[col] = "userID"
+        elif "driver" in lc or "user" in lc or "ev" in lc: col_map[col] = "userID"
     df = df.rename(columns=col_map)
     
-    if "Charging Date" in df.columns:
-        if "connectionTime" in df.columns:
-            df["connectionTime"] = df["Charging Date"] + " " + df["connectionTime"]
-        if "disconnectTime" in df.columns:
-            df["disconnectTime"] = df["Charging Date"] + " " + df["disconnectTime"]
+    # Try to find a date column if "Charging Date" (ACN style) isn't there
+    date_col = next((c for c in df.columns if "date" in c.lower()), None)
+    
+    if date_col:
+        # Check if we have the columns and they are strings (not already datetimes)
+        for col in ["connectionTime", "disconnectTime"]:
+            if col in df.columns:
+                # If it's a Series (single column) and looks like just time (no date separator)
+                series = df[col]
+                if not isinstance(series, pd.Series): # Handle multi-column naming collision just in case
+                    series = series.iloc[:, 0]
+                
+                if series.dtype == object:
+                    sample = str(series.dropna().iloc[0]) if not series.dropna().empty else ""
+                    if ":" in sample and "-" not in sample and "/" not in sample:
+                        df[col] = df[date_col].astype(str) + " " + series.astype(str)
             
     df["connectionTime"] = pd.to_datetime(df["connectionTime"], utc=True, errors="coerce")
     df["disconnectTime"] = pd.to_datetime(df["disconnectTime"], utc=True, errors="coerce")
