@@ -3,6 +3,7 @@ import requests
 import folium
 from streamlit_folium import st_folium
 import numpy as np
+import pandas as pd
 
 # ─── Config ──────────────────────────────────────────────────
 API_URL = "http://localhost:8000"
@@ -13,16 +14,23 @@ st.set_page_config(
     layout="wide"
 )
 
+# ─── Data Fetching ───────────────────────────────────────────
+@st.cache_data(ttl=5)
+def fetch_api(endpoint):
+    try:
+        r = requests.get(f"{API_URL}{endpoint}", timeout=10)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
 # ─── Header ──────────────────────────────────────────────────
 st.title("⚡ EVolvAI — EV Infrastructure Dashboard")
 st.caption("IEEE IES Hackathon | Physics-Constrained Generative AI for Equitable EV Planning")
-
 st.divider()
 
 # ─── Sidebar ─────────────────────────────────────────────────
 with st.sidebar:
     st.header("Scenario Control")
-    
     scenario = st.selectbox(
         "Select Counterfactual Scenario",
         options=["baseline", "winter_storm", "fleet_2x"],
@@ -33,93 +41,53 @@ with st.sidebar:
         }[x]
     )
     
+    show_real = st.checkbox("Show real EV chargers (OpenChargeMap)", value=True)
+    
     st.divider()
     st.markdown("**Color Legend**")
     st.markdown("🟢 Green = Node operating normally")
     st.markdown("🔴 Red = Transformer overloaded")
     st.markdown("⚪ Circle size = Charger count")
+    st.markdown("🔵 Blue = Real world EV charger")
     
     st.divider()
     st.markdown("**About**")
-    st.caption("This dashboard visualizes the IEEE 33-bus system mapped to Hyderabad, India. "
-               "Node colors reflect transformer overload status under selected scenario conditions.")
+    st.caption("This dashboard visualizes the IEEE 33-bus system mapped to Hyderabad, India.")
 
+# ─── Get Data ────────────────────────────────────────────────
+node_data = fetch_api(f"/api/nodes/{scenario}")
+gini_data = fetch_api(f"/api/gini/{scenario}")
 
-# ─── Fetch data from Files ─────────────────────────────────────
-import os
-import json
-from gini import calculate_gini, get_accessibility_scores
+if "error" in node_data:
+    st.error(f"Cannot connect to API at {API_URL}. Is it running? (uvicorn api:app)")
+    st.stop()
 
-# Load mock nodes for coordinates
-mock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mock_data.json")
-with open(mock_path, "r") as f:
-    RAW_DATA = json.load(f)
-nodes = RAW_DATA["nodes"]
+nodes = node_data["nodes"]
 
-# Load optimal layout
-layout_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output", "final_optimal_layout.json")
-
-try:
-    with open(layout_path, "r") as f:
-        optimal_data = json.load(f)
-    
-    # map optimal data to nodes
-    bus_ids = optimal_data["bus_ids"] # likely 2 to 33
-    power_kw_list = optimal_data["power_kw"]
-    
-    for node in nodes:
-        bus = node["node_id"]
-        if bus in bus_ids:
-            idx = bus_ids.index(bus)
-            ports = int(power_kw_list[idx] / 50.0)
-            node["charger_count"] = ports
-        else:
-            node["charger_count"] = 0
-            
-except FileNotFoundError:
-    st.warning("Optimizer output not found. Run the optimizer first. Falling back to mock data.")
-
-# Update Gini Score for each node
-scores = get_accessibility_scores(nodes)
-gini_index = calculate_gini(scores)
-
-gini_data = {"gini_index": gini_index}
+# Fetch real chargers if enabled
+real_chargers = []
+if show_real:
+    real_data = fetch_api("/api/real_chargers")
+    if "chargers" in real_data:
+        real_chargers = real_data["chargers"]
+        st.sidebar.success(f"Showing {len(real_chargers)} real chargers")
+    else:
+        st.sidebar.warning(f"Could not load real chargers: {real_data.get('error', 'Unknown error')}")
 
 # ─── Top Metrics Row ─────────────────────────────────────────
 col1, col2, col3, col4 = st.columns(4)
-
 with col1:
-    gini_val = gini_data["gini_index"] if gini_data else "N/A"
-    st.metric(
-        label="Gini Accessibility Index",
-        value=f"{gini_val:.3f}" if isinstance(gini_val, float) else gini_val,
-        help="0 = equal access everywhere. 1 = all chargers in one area."
-    )
-
+    gini_val = gini_data.get("gini_index", "N/A")
+    st.metric("Gini Accessibility Index", f"{gini_val:.3f}" if isinstance(gini_val, float) else gini_val)
 with col2:
     overloaded = sum(1 for n in nodes if n["transformer_overload"])
-    st.metric(
-        label="Overloaded Transformers",
-        value=f"{overloaded} / {len(nodes)}",
-        delta=f"{overloaded} at risk",
-        delta_color="inverse"
-    )
-
+    st.metric("Overloaded Transformers", f"{overloaded} / {len(nodes)}", f"{overloaded} at risk", delta_color="inverse")
 with col3:
     total_chargers = sum(n["charger_count"] for n in nodes)
-    st.metric(
-        label="Total Chargers",
-        value=total_chargers
-    )
-
+    st.metric("Total Chargers (Grid)", total_chargers)
 with col4:
     zero_nodes = sum(1 for n in nodes if n["charger_count"] == 0)
-    st.metric(
-        label="Nodes Without Chargers",
-        value=zero_nodes,
-        delta=f"{zero_nodes} underserved zones",
-        delta_color="inverse"
-    )
+    st.metric("Nodes w/o Chargers", zero_nodes, f"{zero_nodes} underserved", delta_color="inverse")
 
 st.divider()
 
@@ -129,74 +97,49 @@ map_col, table_col = st.columns([2, 1])
 with map_col:
     st.subheader("IEEE 33-Bus System — Hyderabad Grid Map")
     
-    # Build Folium map
-    center_lat = np.mean([n["lat"] for n in nodes])
-    center_lng = np.mean([n["lng"] for n in nodes])
-    
     m = folium.Map(
-        location=[center_lat, center_lng],
+        location=[np.mean([n["lat"] for n in nodes]), np.mean([n["lng"] for n in nodes])],
         zoom_start=12,
         tiles="CartoDB positron"
     )
     
+    # 1. Add IEEE Nodes
     for node in nodes:
         color = "red" if node["transformer_overload"] else "green"
-        radius = max(5, node["charger_count"] * 2.5)
-        
-        # Tooltip text
-        tooltip_text = (
-            f"Node {node['node_id']} | Zone: {node['zone'].upper()}\n"
-            f"Chargers: {node['charger_count']}\n"
-            f"Gini Score: {node['gini_score']}\n"
-            f"Status: {'OVERLOADED' if node['transformer_overload'] else 'Normal'}"
-        )
-        
-        # Popup with more detail
-        popup_html = f"""
-        <div style='font-family:sans-serif; font-size:13px; min-width:160px'>
-            <b>Node {node['node_id']}</b><br>
-            Zone: {node['zone'].upper()}<br>
-            Chargers: {node['charger_count']}<br>
-            Gini Score: {node['gini_score']}<br>
-            <span style='color:{"red" if node["transformer_overload"] else "green"}'>
-                {"⚠ TRANSFORMER OVERLOADED" if node["transformer_overload"] else "✓ Normal operation"}
-            </span>
-        </div>
-        """
-        
         folium.CircleMarker(
             location=[node["lat"], node["lng"]],
-            radius=radius,
+            radius=max(5, node["charger_count"] * 2.5),
             color=color,
             fill=True,
-            fill_color=color,
             fill_opacity=0.7,
-            weight=1.5,
-            tooltip=tooltip_text,
-            popup=folium.Popup(popup_html, max_width=200)
+            tooltip=f"Node {node['node_id']} | Chargers: {node['charger_count']}",
+            popup=f"Node {node['node_id']}<br>Zone: {node['zone']}<br>Chargers: {node['charger_count']}"
         ).add_to(m)
         
-        # Node ID label
         folium.Marker(
             location=[node["lat"], node["lng"]],
-            icon=folium.DivIcon(
-                html=f'<div style="font-size:9px;color:#333;font-weight:bold">{node["node_id"]}</div>',
-                icon_size=(20, 10),
-                icon_anchor=(10, 0)
-            )
+            icon=folium.DivIcon(html=f'<div style="font-size:9px;font-weight:bold">{node["node_id"]}</div>')
         ).add_to(m)
+
+    # 2. Add Real Chargers (Blue)
+    for charger in real_chargers:
+        if charger["lat"] and charger["lng"]:
+            folium.CircleMarker(
+                location=[charger["lat"], charger["lng"]],
+                radius=6,
+                color="blue",
+                fill=True,
+                fill_opacity=0.8,
+                tooltip=f"REAL CHARGER: {charger['name']}",
+                popup=f"<b>{charger['name']}</b><br>{charger['address']}"
+            ).add_to(m)
     
+    # 3. RENDER MAP ONCE
     st_folium(m, width=700, height=500)
 
 with table_col:
     st.subheader("Node Status Table")
-    
-    # Filter options
-    filter_opt = st.radio(
-        "Show",
-        ["All nodes", "Overloaded only", "No chargers"],
-        horizontal=False
-    )
+    filter_opt = st.radio("Show", ["All nodes", "Overloaded only", "No chargers"])
     
     if filter_opt == "Overloaded only":
         display_nodes = [n for n in nodes if n["transformer_overload"]]
@@ -205,39 +148,16 @@ with table_col:
     else:
         display_nodes = nodes
     
-    # Build display rows
-    import pandas as pd
-    rows = []
-    for n in display_nodes:
-        rows.append({
-            "Node": n["node_id"],
-            "Zone": n["zone"],
-            "Chargers": n["charger_count"],
-            "Gini": n["gini_score"],
-            "Status": "🔴 Overloaded" if n["transformer_overload"] else "🟢 Normal"
-        })
-    
+    rows = [{"Node": n["node_id"], "Zone": n["zone"], "Chargers": n["charger_count"], "Status": "🔴 Overloaded" if n["transformer_overload"] else "🟢 Normal"} for n in display_nodes]
     if rows:
-        df = pd.DataFrame(rows)
-        st.dataframe(df, hide_index=True, height=420)
-    else:
-        st.info("No nodes match this filter.")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, height=400)
 
 # ─── Gini Chart ──────────────────────────────────────────────
 st.divider()
 st.subheader("Gini Score Distribution Across Nodes")
-
-import pandas as pd
-
-gini_df = pd.DataFrame([
-    {"Node": f"N{n['node_id']}", "Gini Score": n["gini_score"], "Zone": n["zone"]}
-    for n in sorted(nodes, key=lambda x: x["gini_score"])
-])
-
+gini_df = pd.DataFrame([{"Node": f"N{n['node_id']}", "Gini Score": n["gini_score"]} for n in sorted(nodes, key=lambda x: x["gini_score"])])
 st.bar_chart(gini_df.set_index("Node")["Gini Score"])
-st.caption("Higher Gini score = more underserved / inequitable access. "
-           "Nodes above 0.7 are critically underserved.")
 
 # ─── Footer ──────────────────────────────────────────────────
 st.divider()
-st.caption("EVolvAI | IEEE IES GenAI Hackathon | Dashboard by Krishna (Geospatial & UI Module)")
+st.caption("EVolvAI | IEEE IES GenAI Hackathon | Dashboard by Krishna")
