@@ -211,6 +211,23 @@ class EVDemandDataset(Dataset):
         weather = rng.uniform(-10, 40,
                               (n_days, seq_len, config.NUM_WEATHER_FEATURES)).astype(np.float32)
 
+        try:
+            import pandas as pd
+            import os
+            weather_parquet_path = os.path.join(config.PROJECT_ROOT, "weather_data.parquet")
+            if os.path.exists(weather_parquet_path):
+                df_w = pd.read_parquet(weather_parquet_path)
+                feat_cols = ['temperature_c', 'precipitation_mm', 'solar_availability', 'traffic_index']
+                if all(col in df_w.columns for col in ['date', 'hour'] + feat_cols):
+                    df_w = df_w.sort_values(by=['date', 'hour'])
+                    for i, d in enumerate(self._dates):
+                        day_weather = df_w[df_w['date'] == d]
+                        if len(day_weather) == seq_len:
+                            weather[i] = day_weather[feat_cols].values.astype(np.float32)
+                    log.info("Integrated real weather data from weather_data.parquet")
+        except Exception as e:
+            log.warning(f"Failed to integrate real weather data from parquet: {e}")
+
         # Z-score normalise demand and weather separately
         demand_n  = _znorm(demand)
         weather_n = _znorm(weather)

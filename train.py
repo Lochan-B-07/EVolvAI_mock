@@ -170,6 +170,10 @@ def train(args):
                 f"β={beta:.2f}  λ={lam:.2f}  lr={lr_now:.1e}  "
                 f"elapsed={elapsed:.1f}min  ETA={eta:.1f}min"
             )
+            drive_dir = os.path.join(args.output, "..", "google_drive_sync")
+            os.makedirs(drive_dir, exist_ok=True)
+            bkp = os.path.join(drive_dir, f"gcvae_model_ep{epoch}.pt")
+            torch.save(model.state_dict(), bkp)
 
     total_min = (time.time() - t_start) / 60
     print(f"\n[train] Finished in {total_min:.1f} min ✓")
