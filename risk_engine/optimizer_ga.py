@@ -736,7 +736,7 @@ def _demo() -> None:
     results.  Invoked via `python -m risk_engine.optimizer_ga`.
     """
     # ── configuration ────────────────────────────────────────────────
-    N_NODES = 15
+    N_NODES = 32
     N_SCENARIOS = 200
     config = EVOptimizerConfig(
         pop_size=80,
@@ -749,9 +749,9 @@ def _demo() -> None:
 
     # ── demand: load Sujay's generated tensor if available ─────────────────
     rng = np.random.default_rng(config.seed)
-    tensor_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "extreme_demand_tensor.npy")
+    tensor_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output", "extreme_winter_storm.npy")
     if os.path.exists(tensor_path):
-        print("Using extreme_demand_tensor from Sujay...")
+        print(f"Using generated tensor: {tensor_path}...")
         demand_scenarios = np.load(tensor_path)
         # Squeeze or format to [S, N] correctly
         if demand_scenarios.ndim == 3: 
